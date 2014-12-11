@@ -1,6 +1,5 @@
 package org.json.zip;
 
-
 /*
  Copyright (c) 2013 JSON.org
 
@@ -27,8 +26,10 @@ package org.json.zip;
 
 /**
  * JSONzip is a binary-encoded JSON dialect. It is designed to compress the
- * messages in a session. It is adaptive, so with each message seen, it should
- * improve its compression. It minimizes JSON's overhead, reducing punctuation
+ * messages in a session in bandwidth constrained applications, such as mobile.
+ *
+ * JSONzip is adaptive, so with each message seen, it should improve its
+ * compression. It minimizes JSON's overhead, reducing punctuation
  * to a small number of bits. It uses Huffman encoding to reduce the average
  * size of characters. It uses caches (or Keeps) to keep recently seen strings
  * and values, so repetitive content (such as object keys) can be
@@ -43,38 +44,15 @@ package org.json.zip;
  * ADEQUATELY FOR PRODUCTION USE.
  *
  * @author JSON.org
- * @version 2013-04-18
+ * @version 2014-05-20
  */
 public abstract class JSONzip implements None, PostMortem {
-    /**
-     * Powers of 2.
-     */
-    public static final int[] twos = {
-        1, 2, 4, 8, 16, 32, 64, 128, 256, 512,
-        1024, 2048, 4096, 8192, 16384, 32768, 65536
-    };
-
     /**
      * The characters in JSON numbers can be reduced to 4 bits each.
      */
     public static final byte[] bcd = {
         '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.', '-', '+', 'E'
     };
-
-    /**
-     * The number of integers that can be encoded in 4 bits.
-     */
-    public static final long int4 = 16;
-
-    /**
-     * The number of integers that can be encoded in 7 bits.
-     */
-    public static final long int7 = 128;
-
-    /**
-     * The number of integers that can be encoded in 14 bits.
-     */
-    public static final long int14 = 16384;
 
     /**
      * The end of string code.
@@ -87,26 +65,24 @@ public abstract class JSONzip implements None, PostMortem {
     public static final int endOfNumber = bcd.length;
 
     /**
-     * The maximum substring length when registering many. The registration of
-     * one substring may be longer.
+     * The first positive integer that cannot be encoded in 4 bits.
      */
-    public static final int maxSubstringLength = 10;
+    public static final long int4 = 16;
 
     /**
-     * The minimum substring length.
+     * The first positive integer that cannot be encoded in 7 bits.
      */
-    public static final int minSubstringLength = 3;
+    public static final long int7 = 144;
+
+    /**
+     * The first positive integer that cannot be encoded in 14 bits.
+     */
+    public static final long int14 = 16528;
 
     /**
      * The package supports tracing for debugging.
      */
     public static final boolean probe = false;
-
-    /**
-     * The maximum number of substrings added to the substrings keep per
-     * string.
-     */
-    public static final int substringLimit = 40;
 
     /**
      * The value code for an empty object.
@@ -154,62 +130,56 @@ public abstract class JSONzip implements None, PostMortem {
     protected final Huff namehuff;
 
     /**
-     * A place to keep the names (keys).
+     * A Huffman encoder for names extended bytes.
      */
-    protected final MapKeep namekeep;
+    protected final Huff namehuffext;
 
     /**
-     * A place to keep the strings.
+     * A place to keep the names (keys).
      */
-    protected final MapKeep stringkeep;
+    protected final Keep namekeep;
 
     /**
      * A Huffman encoder for string values.
      */
-    protected final Huff substringhuff;
+    protected final Huff stringhuff;
+
+    /**
+     * A Huffman encoder for string values extended bytes.
+     */
+    protected final Huff stringhuffext;
 
     /**
      * A place to keep the strings.
      */
-    protected final TrieKeep substringkeep;
+    protected final Keep stringkeep;
 
     /**
      * A place to keep the values.
      */
-    protected final MapKeep values;
+    protected final Keep valuekeep;
 
     /**
      * Initialize the data structures.
      */
     protected JSONzip() {
         this.namehuff = new Huff(end + 1);
-        this.namekeep = new MapKeep(9);
-        this.stringkeep = new MapKeep(11);
-        this.substringhuff = new Huff(end + 1);
-        this.substringkeep = new TrieKeep(12);
-        this.values = new MapKeep(10);
-
-// Increase the weights of the ASCII letters, digits, and special characters
-// because they are highly likely to occur more frequently. The weight of each
-// character will increase as it is used. The Huffman encoder will tend to
-// use fewer bits to encode heavier characters.
-
-        this.namehuff.tick(' ', '}');
-        this.namehuff.tick('a', 'z');
-        this.namehuff.tick(end);
-        this.namehuff.tick(end);
-        this.substringhuff.tick(' ', '}');
-        this.substringhuff.tick('a', 'z');
-        this.substringhuff.tick(end);
-        this.substringhuff.tick(end);
+        this.namehuffext = new Huff(end + 1);
+        this.namekeep = new Keep(9);
+        this.stringhuff = new Huff(end + 1);
+        this.stringhuffext = new Huff(end + 1);
+        this.stringkeep = new Keep(11);
+        this.valuekeep = new Keep(10);
     }
 
     /**
-     *
+     * Generate the Huffman tables.
      */
-    protected void begin() {
+    protected void generate() {
         this.namehuff.generate();
-        this.substringhuff.generate();
+        this.namehuffext.generate();
+        this.stringhuff.generate();
+        this.stringhuffext.generate();
     }
 
     /**
@@ -222,7 +192,7 @@ public abstract class JSONzip implements None, PostMortem {
     /**
      * Write an integer to the console.
      *
-     * @param integer
+     * @param integer The integer to write to the log.
      */
     static void log(int integer) {
         log(integer + " ");
@@ -230,18 +200,23 @@ public abstract class JSONzip implements None, PostMortem {
 
     /**
      * Write two integers, separated by ':' to the console.
+     * The second integer is suppressed if it is 1.
      *
-     * @param integer
-     * @param width
+     * @param integer The integer to write to the log.
+     * @param width The width of the integer in bits.
      */
     static void log(int integer, int width) {
-        log(integer + ":" + width + " ");
+        if (width == 1) {
+            log(integer);
+        } else {
+            log(integer + ":" + width + " ");
+        }
     }
 
     /**
      * Write a string to the console.
      *
-     * @param string
+     * @param string The string to be written to the log.
      */
     static void log(String string) {
         System.out.print(string);
@@ -250,8 +225,8 @@ public abstract class JSONzip implements None, PostMortem {
     /**
      * Write a character or its code to the console.
      *
-     * @param integer
-     * @param width
+     * @param integer The charcode to be written to the log.
+     * @param width The width of the charcode in bits.
      */
     static void logchar(int integer, int width) {
         if (integer > ' ' && integer <= '}') {
@@ -274,8 +249,7 @@ public abstract class JSONzip implements None, PostMortem {
         return this.namehuff.postMortem(that.namehuff)
                 && this.namekeep.postMortem(that.namekeep)
                 && this.stringkeep.postMortem(that.stringkeep)
-                && this.substringhuff.postMortem(that.substringhuff)
-                && this.substringkeep.postMortem(that.substringkeep)
-                && this.values.postMortem(that.values);
+                && this.stringhuff.postMortem(that.stringhuff)
+                && this.valuekeep.postMortem(that.valuekeep);
     }
 }
